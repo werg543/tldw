@@ -20,6 +20,8 @@ function parseArgs(argv) {
     else if (t === '--python') a.python = argv[++i];
     else if (t === '--no-transcribe') a.transcribe = false;
     else if (t === '--ocr') a.ocr = true;
+    else if (t === '--review') { const n = argv[i + 1]; if (n && !n.startsWith('--')) { a.review = n; i++; } else a.review = ''; }
+    else if (t === '--llm') a.llm = argv[++i];
     else rest.push(t);
   }
   a.url = rest[0];
@@ -93,10 +95,26 @@ async function readCaption(page, platform) {
 // Capture the post's media tracks by content-type, then refetch each in full.
 // Live responses are often partial (DASH/range), so strip range params and ask
 // for the whole file. Works across cdninstagram, tiktokcdn, and googlevideo.
+function hasVideoTrack(bases) {
+  for (const [base] of bases) if (/\.mp4|videoplayback/.test(base)) return true;
+  return bases.size > 0;
+}
+
 async function grabVideo(ctx, page, dir) {
   const bases = page._media || new Map();
-  await page.locator('video').first().click({ timeout: 4000 }).catch(() => {});
-  await page.waitForTimeout(4500);
+  await page.bringToFront().catch(() => {});
+  // backgrounded/idle tabs throttle autoplay, so force playback and poll until
+  // the media actually streams rather than waiting a fixed time and hoping.
+  for (let tries = 0; tries < 8 && !hasVideoTrack(bases); tries++) {
+    await page.locator('video').first().scrollIntoViewIfNeeded({ timeout: 2000 }).catch(() => {});
+    await page.locator('video').first().click({ timeout: 2000 }).catch(() => {});
+    await page.evaluate(() => {
+      const v = document.querySelector('video');
+      if (v) { v.muted = true; v.currentTime = 0; v.play().catch(() => {}); }
+    }).catch(() => {});
+    await page.waitForTimeout(1800);
+  }
+  console.log(`captured ${bases.size} media url(s)`);
   const files = [];
   let i = 0;
   for (const [, full] of bases) {
@@ -126,31 +144,37 @@ function muxBest(files, dir) {
   return out;
 }
 
-// Walk a carousel, saving the highest-resolution image loaded for each slide.
+// Walk a carousel, saving the highest-resolution image for each slide. Advances
+// by clicking Next (revealed on hover) or pressing ArrowRight, and stops when
+// the slide stops changing rather than trusting one selector to disappear.
 async function grabCarousel(page, dir) {
   const slides = [];
-  for (let i = 1; i <= 20; i++) {
-    await page.waitForTimeout(600);
-    const src = await page.evaluate(() => {
-      const imgs = [...document.querySelectorAll('article img, [data-e2e] img, img')];
-      let best = null, area = 0;
-      for (const im of imgs) {
-        const a = im.naturalWidth * im.naturalHeight;
-        if (a > area) { area = a; best = im; }
-      }
-      return best ? (best.currentSrc || best.src) : null;
-    }).catch(() => null);
-    if (src) {
+  const seen = new Set();
+  const biggestSrc = () => page.evaluate(() => {
+    const imgs = [...document.querySelectorAll('article img, [data-e2e] img, img')];
+    let best = null, area = 0;
+    for (const im of imgs) { const a = im.naturalWidth * im.naturalHeight; if (a > area) { area = a; best = im; } }
+    return best ? (best.currentSrc || best.src) : null;
+  }).catch(() => null);
+
+  let stale = 0;
+  for (let step = 0; step < 25 && stale < 2; step++) {
+    await page.waitForTimeout(500);
+    const src = await biggestSrc();
+    if (src && !seen.has(src)) {
+      seen.add(src);
+      stale = 0;
       const resp = await page.request.get(src).catch(() => null);
       if (resp && resp.ok()) {
-        const f = path.join(dir, `slide_${String(i).padStart(2, '0')}.jpg`);
+        const f = path.join(dir, `slide_${String(slides.length + 1).padStart(2, '0')}.jpg`);
         fs.writeFileSync(f, Buffer.from(await resp.body()));
         slides.push(f);
       }
-    }
-    const next = page.locator('button[aria-label="Next"], [aria-label="Next"]');
+    } else { stale++; }
+    await page.locator('article, main, section').first().hover().catch(() => {});
+    const next = page.locator('button[aria-label="Next"], [aria-label="Next"], button:has(svg[aria-label="Next"])');
     if (await next.count().catch(() => 0)) await next.first().click().catch(() => {});
-    else break;
+    else await page.keyboard.press('ArrowRight').catch(() => {});
   }
   return slides;
 }
@@ -175,11 +199,36 @@ function ocr(imgs, dir) {
   return { ok: true, text };
 }
 
+// Optional review step: hand the extracted text to an LLM CLI and ask whether
+// the content is worth acting on, through a caller-supplied lens. The command
+// is configurable (env TLDW_LLM or --llm); it defaults to `claude -p` but the
+// tool does not require it — review is off unless you pass --review.
+function review(meta, dir, lens, llmArg) {
+  const body = (meta.transcript || meta.text || '').trim();
+  if (!body) return { ok: false, error: 'nothing textual to review (no transcript/OCR text; try --ocr for carousels)' };
+  const prompt = [
+    'Review this short-form social post for whether it is worth acting on.',
+    `Lens: ${lens || 'general usefulness'}`,
+    '',
+    'Answer concisely:',
+    '1. Effectiveness — what is genuinely valuable or insightful here, if anything.',
+    '2. Efficiency — effort to act on vs the payoff.',
+    '3. Action — the single best next step, or "skip" if not worth it.',
+    '',
+    `caption: ${meta.caption || '(none)'}`,
+    `content: ${body}`
+  ].join('\n');
+  const cmd = (llmArg || process.env.TLDW_LLM || 'claude -p').split(' ');
+  const r = spawnSync(cmd[0], [...cmd.slice(1), prompt], { encoding: 'utf8' });
+  if (r.status !== 0) return { ok: false, error: (r.stderr || '').trim() || `review command failed (${cmd[0]} not found?)` };
+  return { ok: true, text: r.stdout.trim() };
+}
+
 async function main() {
   const a = parseArgs(process.argv.slice(2));
   const target = a.url && resolve(a.url);
   if (!target) {
-    console.error('usage: tldw <url> [--out DIR] [--cdp URL] [--fps N] [--model base] [--ocr] [--no-transcribe]');
+    console.error('usage: tldw <url> [--out DIR] [--cdp URL] [--fps N] [--model base] [--ocr] [--review "lens"] [--llm "cmd"] [--no-transcribe]');
     console.error('supports: instagram.com/reel|p|tv, tiktok.com/@u/video|photo, youtube.com/shorts');
     process.exit(2);
   }
@@ -196,6 +245,14 @@ async function main() {
   try {
     console.log(`opening ${target.platform}/${target.id} ...`);
     const page = await openPage(ctx, a.url);
+
+    const walled = await page.evaluate(() => {
+      const t = document.body.innerText || '';
+      const media = document.querySelectorAll('video, article img, img').length;
+      return media === 0 && /log in|sign up|see this content|isn.?t available|create an account/i.test(t);
+    }).catch(() => false);
+    if (walled) throw new Error('post is behind a login wall — the browser on --cdp is not logged in to this platform (or has been rate-limited). Log in there, slow down, and retry.');
+
     meta.caption = await readCaption(page, target.platform);
 
     let type = target.type;
@@ -207,7 +264,7 @@ async function main() {
       const files = await grabVideo(ctx, page, dir);
       const video = muxBest(files, dir);
       for (const f of files) if (f !== video) fs.rmSync(f, { force: true });
-      if (!video) throw new Error('no video track captured; did playback start? (some platforms need the tab focused)');
+      if (!video) throw new Error('no video track captured — playback never streamed. The browser on --cdp may not be logged in, may be rate-limited, or the tab could not autoplay. Log in there, slow down, and retry.');
       const p = probe(video);
       meta.durationSec = p.duration;
       console.log(`video.mp4 ready (${p.duration?.toFixed(1)}s)`);
@@ -238,6 +295,12 @@ async function main() {
     await page.close().catch(() => {});
   } finally {
     await browser.close().catch(() => {});
+  }
+
+  if (a.review !== undefined) {
+    const r = review(meta, dir, a.review, a.llm);
+    if (r.ok) { meta.review = r.text; fs.writeFileSync(path.join(dir, 'review.md'), r.text + '\n'); console.log('review.md written'); }
+    else console.warn('skipped review:', r.error);
   }
 
   fs.writeFileSync(path.join(dir, 'meta.json'), JSON.stringify(meta, null, 2));
