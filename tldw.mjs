@@ -115,6 +115,12 @@ async function grabVideo(ctx, page, dir) {
     await page.waitForTimeout(1800);
   }
   console.log(`captured ${bases.size} media url(s)`);
+  // the duration of the reel actually on screen, used to reject preloaded
+  // neighbor reels that Instagram streams into the same page.
+  const targetDuration = await page.evaluate(() => {
+    const v = document.querySelector('video');
+    return v && isFinite(v.duration) ? v.duration : null;
+  }).catch(() => null);
   const files = [];
   let i = 0;
   for (const [, full] of bases) {
@@ -128,16 +134,27 @@ async function grabVideo(ctx, page, dir) {
     files.push(f);
     i++;
   }
-  return files;
+  return { files, targetDuration };
 }
 
-function muxBest(files, dir) {
+// Pick the track matching the on-screen reel. When we know the displayed
+// duration, prefer tracks within ~1.5s of it so a longer preloaded neighbor
+// cannot win on size alone; otherwise fall back to largest.
+function pickByDuration(tracks, targetDuration) {
+  if (targetDuration) {
+    const near = tracks.filter((t) => Math.abs(t.duration - targetDuration) <= 1.5);
+    if (near.length) return near.sort((a, b) => b.size - a.size)[0];
+  }
+  return tracks.sort((a, b) => b.size - a.size)[0];
+}
+
+function muxBest(files, dir, targetDuration) {
   const tracks = files.map((f) => ({ f, ...probe(f) })).filter((t) => t.ok);
-  const video = tracks.filter((t) => t.hasVideo).sort((a, b) => b.size - a.size)[0];
+  const video = pickByDuration(tracks.filter((t) => t.hasVideo), targetDuration);
   if (!video) return null;
   const out = path.join(dir, 'video.mp4');
   if (video.hasVideo && video.hasAudio) { fs.copyFileSync(video.f, out); return out; }
-  const audio = tracks.filter((t) => t.hasAudio).sort((a, b) => b.size - a.size)[0];
+  const audio = pickByDuration(tracks.filter((t) => t.hasAudio && t.f !== video.f), targetDuration);
   if (!audio) { fs.copyFileSync(video.f, out); return out; }
   execFileSync('ffmpeg', ['-y', '-loglevel', 'error', '-i', video.f, '-i', audio.f,
     '-c', 'copy', '-map', '0:v:0', '-map', '1:a:0', out]);
@@ -261,8 +278,8 @@ async function main() {
     console.log(`type: ${type}`);
 
     if (type === 'video') {
-      const files = await grabVideo(ctx, page, dir);
-      const video = muxBest(files, dir);
+      const { files, targetDuration } = await grabVideo(ctx, page, dir);
+      const video = muxBest(files, dir, targetDuration);
       for (const f of files) if (f !== video) fs.rmSync(f, { force: true });
       if (!video) throw new Error('no video track captured — playback never streamed. The browser on --cdp may not be logged in, may be rate-limited, or the tab could not autoplay. Log in there, slow down, and retry.');
       const p = probe(video);
