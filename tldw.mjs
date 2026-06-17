@@ -319,9 +319,10 @@ async function main() {
     const browser = await chromium.connectOverCDP(a.cdp);
     const ctx = browser.contexts()[0];
     if (!ctx) { console.error('no browser context on the CDP endpoint; is the authenticated browser running?'); process.exit(1); }
+    let page = null;
     try {
       console.log(`opening ${target.platform}/${target.id} ...`);
-      const page = await openPage(ctx, a.url);
+      page = await openPage(ctx, a.url);
 
       const walled = await page.evaluate(() => {
         const t = document.body.innerText || '';
@@ -353,8 +354,9 @@ async function main() {
           else console.warn('skipped OCR:', o.error);
         }
       }
-      await page.close().catch(() => {});
     } finally {
+      // always close our tab so reels do not keep playing in the user's browser
+      if (page) await page.close().catch(() => {});
       await browser.close().catch(() => {});
     }
   }
