@@ -36,6 +36,7 @@ function resolve(url) {
   if ((m = url.match(/instagram\.com\/(?:reel|tv)\/([^/?#]+)/i))) return { platform: 'instagram', type: 'video', id: m[1] };
   if ((m = url.match(/instagram\.com\/p\/([^/?#]+)/i))) return { platform: 'instagram', type: 'auto', id: m[1] };
   if ((m = url.match(/tiktok\.com\/@[^/]+\/video\/(\d+)/i))) return { platform: 'tiktok', type: 'video', id: m[1] };
+  if ((m = url.match(/tiktok\.com\/t\/([^/?#]+)/i))) return { platform: 'tiktok', type: 'video', id: m[1] };
   if (/(?:vm|vt)\.tiktok\.com\//i.test(url)) return { platform: 'tiktok', type: 'video', id: 'tiktok' };
   if (/tiktok\.com\/.*\/photo\//i.test(url)) return { platform: 'tiktok', type: 'carousel', id: 'tiktok' };
   if ((m = url.match(/youtube\.com\/shorts\/([\w-]+)/i))) return { platform: 'youtube', type: 'video', id: m[1] };
@@ -248,8 +249,11 @@ function review(meta, dir, lens, llmArg) {
 function grabWithYtdlp(url, dir, ytdlpArg) {
   const cmd = (ytdlpArg || process.env.TLDW_YTDLP || 'yt-dlp').split(' ');
   const out = path.join(dir, 'video.%(ext)s');
+  // TikTok drops requests without a real browser UA; harmless for YouTube.
+  const ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36';
   const r = spawnSync(cmd[0], [...cmd.slice(1),
     '--no-playlist', '--no-warnings', '--write-info-json',
+    '--user-agent', ua, '--retries', '3', '--socket-timeout', '20',
     '-f', 'bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b', '--merge-output-format', 'mp4',
     '-o', out, url], { encoding: 'utf8' });
   const file = path.join(dir, 'video.mp4');
