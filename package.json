@@ -1,0 +1,12 @@
+{
+  "name": "reeler",
+  "version": "0.1.0",
+  "description": "Pull an Instagram reel through an authenticated browser (CDP), reassemble it, transcribe it, and sample frames.",
+  "type": "module",
+  "bin": { "reeler": "reeler.mjs" },
+  "scripts": { "start": "node reeler.mjs" },
+  "license": "MIT",
+  "dependencies": {
+    "playwright-core": "^1.40.0"
+  }
+}
