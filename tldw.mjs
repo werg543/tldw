@@ -22,6 +22,7 @@ function parseArgs(argv) {
     else if (t === '--ocr') a.ocr = true;
     else if (t === '--review') { const n = argv[i + 1]; if (n && !n.startsWith('--')) { a.review = n; i++; } else a.review = ''; }
     else if (t === '--llm') a.llm = argv[++i];
+    else if (t === '--ytdlp') a.ytdlp = argv[++i];
     else rest.push(t);
   }
   a.url = rest[0];
@@ -241,6 +242,48 @@ function review(meta, dir, lens, llmArg) {
   return { ok: true, text: r.stdout.trim() };
 }
 
+// YouTube and TikTok serve formats the CDP refetch cannot reassemble (YouTube
+// streams UMP/SABR with signed URLs), so use yt-dlp, which handles them and
+// needs no login for public posts. Writes video.mp4 + video.info.json.
+function grabWithYtdlp(url, dir, ytdlpArg) {
+  const cmd = (ytdlpArg || process.env.TLDW_YTDLP || 'yt-dlp').split(' ');
+  const out = path.join(dir, 'video.%(ext)s');
+  const r = spawnSync(cmd[0], [...cmd.slice(1),
+    '--no-playlist', '--no-warnings', '--write-info-json',
+    '-f', 'bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b', '--merge-output-format', 'mp4',
+    '-o', out, url], { encoding: 'utf8' });
+  const file = path.join(dir, 'video.mp4');
+  if (fs.existsSync(file)) return { ok: true, file };
+  const err = (r.stderr || '').trim().split('\n').pop() || `yt-dlp failed (is it installed? tried "${cmd[0]}")`;
+  return { ok: false, error: err };
+}
+
+function readYtInfo(dir) {
+  try {
+    const j = JSON.parse(fs.readFileSync(path.join(dir, 'video.info.json'), 'utf8'));
+    return { title: j.title || '', description: j.description || '', duration: j.duration || null };
+  } catch { return null; }
+}
+
+// Frames + transcript from a finished video.mp4, shared by every backend.
+function processVideo(videoPath, dir, meta, a) {
+  const p = probe(videoPath);
+  meta.durationSec = meta.durationSec ?? p.duration;
+  console.log(`video.mp4 ready (${(meta.durationSec ?? 0).toFixed?.(1) ?? meta.durationSec}s)`);
+  const frames = path.join(dir, 'frames');
+  fs.mkdirSync(frames, { recursive: true });
+  execFileSync('ffmpeg', ['-y', '-loglevel', 'error', '-i', videoPath, '-vf', `fps=${a.fps}`, path.join(frames, 'f_%02d.jpg')]);
+  meta.frames = fs.readdirSync(frames).length;
+  console.log(`sampled ${meta.frames} frames @ ${a.fps}fps`);
+  if (a.transcribe) {
+    const wav = path.join(dir, 'audio.wav');
+    execFileSync('ffmpeg', ['-y', '-loglevel', 'error', '-i', videoPath, '-ar', '16000', '-ac', '1', wav]);
+    const t = transcribe(wav, a.model, a.python);
+    if (t.ok) { meta.transcript = t.text; fs.writeFileSync(path.join(dir, 'transcript.txt'), t.text + '\n'); console.log('transcript.txt written'); }
+    else console.warn('skipped transcription:', t.error);
+  }
+}
+
 async function main() {
   const a = parseArgs(process.argv.slice(2));
   const target = a.url && resolve(a.url);
@@ -254,64 +297,62 @@ async function main() {
   const dir = path.resolve(a.out || path.join('out', `${target.platform}_${target.id}`));
   fs.mkdirSync(dir, { recursive: true });
 
-  const browser = await chromium.connectOverCDP(a.cdp);
-  const ctx = browser.contexts()[0];
-  if (!ctx) { console.error('no browser context on the CDP endpoint; is the authenticated browser running?'); process.exit(1); }
-
   let meta = { url: a.url, platform: target.platform, id: target.id };
-  try {
-    console.log(`opening ${target.platform}/${target.id} ...`);
-    const page = await openPage(ctx, a.url);
 
-    const walled = await page.evaluate(() => {
-      const t = document.body.innerText || '';
-      const media = document.querySelectorAll('video, article img, img').length;
-      return media === 0 && /log in|sign up|see this content|isn.?t available|create an account/i.test(t);
-    }).catch(() => false);
-    if (walled) throw new Error('post is behind a login wall — the browser on --cdp is not logged in to this platform (or has been rate-limited). Log in there, slow down, and retry.');
+  // YouTube and TikTok video go through yt-dlp (public, no browser). Instagram,
+  // and TikTok image carousels, go through the logged-in CDP browser.
+  const viaYtdlp = (target.platform === 'youtube' || target.platform === 'tiktok') && target.type !== 'carousel';
 
-    meta.caption = await readCaption(page, target.platform);
+  if (viaYtdlp) {
+    console.log(`fetching ${target.platform}/${target.id} via yt-dlp ...`);
+    const g = grabWithYtdlp(a.url, dir, a.ytdlp);
+    if (!g.ok) throw new Error(g.error);
+    meta.type = 'video';
+    const info = readYtInfo(dir);
+    if (info) { meta.caption = info.title; if (info.description) meta.description = info.description; meta.durationSec = info.duration; }
+    processVideo(g.file, dir, meta, a);
+  } else {
+    const browser = await chromium.connectOverCDP(a.cdp);
+    const ctx = browser.contexts()[0];
+    if (!ctx) { console.error('no browser context on the CDP endpoint; is the authenticated browser running?'); process.exit(1); }
+    try {
+      console.log(`opening ${target.platform}/${target.id} ...`);
+      const page = await openPage(ctx, a.url);
 
-    let type = target.type;
-    if (type === 'auto') type = (await page.locator('video').count().catch(() => 0)) ? 'video' : 'carousel';
-    meta.type = type;
-    console.log(`type: ${type}`);
+      const walled = await page.evaluate(() => {
+        const t = document.body.innerText || '';
+        const media = document.querySelectorAll('video, article img, img').length;
+        return media === 0 && /log in|sign up|see this content|isn.?t available|create an account/i.test(t);
+      }).catch(() => false);
+      if (walled) throw new Error('post is behind a login wall — the browser on --cdp is not logged in to this platform (or has been rate-limited). Log in there, slow down, and retry.');
 
-    if (type === 'video') {
-      const { files, targetDuration } = await grabVideo(ctx, page, dir);
-      const video = muxBest(files, dir, targetDuration);
-      for (const f of files) if (f !== video) fs.rmSync(f, { force: true });
-      if (!video) throw new Error('no video track captured — playback never streamed. The browser on --cdp may not be logged in, may be rate-limited, or the tab could not autoplay. Log in there, slow down, and retry.');
-      const p = probe(video);
-      meta.durationSec = p.duration;
-      console.log(`video.mp4 ready (${p.duration?.toFixed(1)}s)`);
+      meta.caption = await readCaption(page, target.platform);
 
-      const frames = path.join(dir, 'frames');
-      fs.mkdirSync(frames, { recursive: true });
-      execFileSync('ffmpeg', ['-y', '-loglevel', 'error', '-i', video, '-vf', `fps=${a.fps}`, path.join(frames, 'f_%02d.jpg')]);
-      meta.frames = fs.readdirSync(frames).length;
-      console.log(`sampled ${meta.frames} frames @ ${a.fps}fps`);
+      let type = target.type;
+      if (type === 'auto') type = (await page.locator('video').count().catch(() => 0)) ? 'video' : 'carousel';
+      meta.type = type;
+      console.log(`type: ${type}`);
 
-      if (a.transcribe) {
-        const wav = path.join(dir, 'audio.wav');
-        execFileSync('ffmpeg', ['-y', '-loglevel', 'error', '-i', video, '-ar', '16000', '-ac', '1', wav]);
-        const t = transcribe(wav, a.model, a.python);
-        if (t.ok) { meta.transcript = t.text; fs.writeFileSync(path.join(dir, 'transcript.txt'), t.text + '\n'); console.log('transcript.txt written'); }
-        else console.warn('skipped transcription:', t.error);
+      if (type === 'video') {
+        const { files, targetDuration } = await grabVideo(ctx, page, dir);
+        const video = muxBest(files, dir, targetDuration);
+        for (const f of files) if (f !== video) fs.rmSync(f, { force: true });
+        if (!video) throw new Error('no video track captured — playback never streamed. The browser on --cdp may not be logged in, may be rate-limited, or the tab could not autoplay. Log in there, slow down, and retry.');
+        processVideo(video, dir, meta, a);
+      } else {
+        const slides = await grabCarousel(page, dir);
+        meta.slides = slides.length;
+        console.log(`saved ${slides.length} slides`);
+        if (a.ocr) {
+          const o = ocr(slides, dir);
+          if (o.ok) { meta.text = o.text; console.log('slides.txt written'); }
+          else console.warn('skipped OCR:', o.error);
+        }
       }
-    } else {
-      const slides = await grabCarousel(page, dir);
-      meta.slides = slides.length;
-      console.log(`saved ${slides.length} slides`);
-      if (a.ocr) {
-        const o = ocr(slides, dir);
-        if (o.ok) { meta.text = o.text; console.log('slides.txt written'); }
-        else console.warn('skipped OCR:', o.error);
-      }
+      await page.close().catch(() => {});
+    } finally {
+      await browser.close().catch(() => {});
     }
-    await page.close().catch(() => {});
-  } finally {
-    await browser.close().catch(() => {});
   }
 
   if (a.review !== undefined) {

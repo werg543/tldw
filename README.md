@@ -21,12 +21,13 @@ Read this part. tldw assumes nothing about your machine beyond these.
 
 - **Node 18+**.
 - **`ffmpeg` and `ffprobe`** on your `PATH`.
-- **Your own logged-in browser**, started with remote debugging on. tldw attaches to it; it does not launch or log into anything for you. Any Chromium browser works (Chrome, Edge, Brave, Opera):
+- **For YouTube and TikTok: [`yt-dlp`](https://github.com/yt-dlp/yt-dlp)** on `PATH` (`pip install yt-dlp`). Those platforms stream formats a browser capture cannot reassemble (YouTube uses UMP/SABR), so tldw shells out to yt-dlp, which handles them and needs no login for public posts. Override the command with `--ytdlp` or `TLDW_YTDLP` (e.g. `--ytdlp "python -m yt_dlp"`).
+- **For Instagram: your own logged-in browser**, started with remote debugging on. tldw attaches to it; it does not launch or log into anything for you. Any Chromium browser works (Chrome, Edge, Brave, Opera):
   ```
   chrome --remote-debugging-port=9226 --user-data-dir="/path/to/a/profile"
   ```
-  Log into the platform in that browser. Point tldw at it with `--cdp http://localhost:<port>` (default `9226`, it is only a default, use whatever port you launched).
-- **No MCP servers are required.** tldw talks to your browser directly over CDP. It does not depend on any Model Context Protocol setup.
+  Log into Instagram in that browser. Point tldw at it with `--cdp http://localhost:<port>` (default `9226`, it is only a default, use whatever port you launched). YouTube and TikTok do not need this.
+- **No MCP servers are required.** tldw talks to your browser over CDP and to yt-dlp as a subprocess. It does not depend on any Model Context Protocol setup.
 - *Optional:* Python with [`faster-whisper`](https://github.com/SYSTRAN/faster-whisper) for transcripts; `tesseract` for carousel OCR; any LLM CLI for `--review`. Each is only needed for the feature that uses it, and tldw tells you when one is missing instead of failing silently.
 
 ## Install
@@ -46,10 +47,10 @@ node tldw.mjs "https://www.youtube.com/shorts/ID"
 
 ## How it works
 
-1. **Resolve** the URL to a platform and media type. An Instagram `/p/` link can be a single image, a carousel, or a video, so that case is detected at runtime.
-2. **Attach + capture** over CDP: open the post, force playback, and collect the media responses (`video/*`, `audio/*`, `.mp4`, `videoplayback`) from the moment the page loads, polling until media actually streams.
+1. **Resolve** the URL to a platform and media type. An Instagram `/p/` link can be a single image, a carousel, or a video, so that case is detected at runtime. YouTube and TikTok video are fetched with **yt-dlp** and skip straight to step 5.
+2. **Attach + capture** over CDP (Instagram): open the post, force playback, and collect the media responses (`video/*`, `audio/*`, `.mp4`, `videoplayback`) from the moment the page loads, polling until media actually streams.
 3. **Refetch full:** strip range params (`bytestart`/`byteend`/`range`) and request `bytes=0-` to get whole files.
-4. **Pick + mux** (video): `ffprobe` each track, take the largest video, mux in audio if it is a separate track.
+4. **Pick + mux** (video): `ffprobe` each track and keep the one matching the on-screen reel's duration so a preloaded neighbor cannot win, muxing in audio if it is a separate track.
 5. **Frames:** `ffmpeg` samples N stills per second.
 6. **Transcribe** (video): `ffmpeg` to 16k mono wav, faster-whisper to text.
 7. **Carousel** instead walks the slides and saves each at full resolution; `--ocr` runs tesseract over them.
@@ -78,6 +79,7 @@ It writes `review.md` with three things: effectiveness (what is actually valuabl
 | `--ocr` | off | OCR carousel slides with tesseract |
 | `--review "lens"` | off | review the result against your lens |
 | `--llm "cmd"` | `claude -p` | LLM command used by `--review` |
+| `--ytdlp "cmd"` | `yt-dlp` | command used to fetch YouTube/TikTok |
 | `--no-transcribe` | off | skip audio transcription |
 
 ## Output
@@ -96,8 +98,9 @@ out/<platform>_<id>/
 
 ## Platform status
 
-- **Instagram** reels, posts (video and carousel) — verified.
-- **TikTok** and **YouTube Shorts** — implemented via the same resolver and capture path. Verify against a live post in your session; the capture-then-refetch mechanic is shared, but platform DOM and CDN quirks may need small tweaks.
+- **Instagram** reels and posts (video and carousel) — verified, via the logged-in CDP browser.
+- **YouTube Shorts** — verified, via yt-dlp.
+- **TikTok** video — via yt-dlp, the same path as YouTube. TikTok image (photo) carousels fall back to the CDP browser.
 
 ## Be a good citizen
 
