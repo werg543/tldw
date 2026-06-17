@@ -1,10 +1,10 @@
 {
-  "name": "reeler",
-  "version": "0.1.0",
-  "description": "Pull an Instagram reel through an authenticated browser (CDP), reassemble it, transcribe it, and sample frames.",
+  "name": "tldw",
+  "version": "0.2.0",
+  "description": "too long; didn't watch — pull a short-form post (Instagram, TikTok, YouTube Shorts) through an authenticated browser via CDP and turn it into text + stills.",
   "type": "module",
-  "bin": { "reeler": "reeler.mjs" },
-  "scripts": { "start": "node reeler.mjs" },
+  "bin": { "tldw": "tldw.mjs" },
+  "scripts": { "start": "node tldw.mjs" },
   "license": "MIT",
   "dependencies": {
     "playwright-core": "^1.40.0"
