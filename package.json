@@ -4,9 +4,15 @@
   "description": "too long; didn't watch — pull a short-form post (Instagram, TikTok, YouTube Shorts) through an authenticated browser via CDP and turn it into text + stills.",
   "type": "module",
   "bin": { "tldw": "tldw.mjs" },
-  "scripts": { "start": "node tldw.mjs" },
+  "scripts": {
+    "start": "node tldw.mjs",
+    "postinstall": "node setup.mjs",
+    "setup": "node setup.mjs"
+  },
   "license": "MIT",
   "dependencies": {
+    "ffmpeg-static": "^5.2.0",
+    "ffprobe-static": "^3.1.0",
     "playwright-core": "^1.40.0"
   }
 }

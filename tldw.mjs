@@ -7,6 +7,27 @@ import { chromium } from 'playwright-core';
 import { execFileSync, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import ffmpegStatic from 'ffmpeg-static';
+import ffprobeStatic from 'ffprobe-static';
+
+// Resolve the external tools to the binaries `npm install` provisioned, so a
+// fresh clone needs nothing on PATH. Env overrides still win; bare-name fallback
+// keeps things working if a user supplies their own on PATH instead.
+const here = path.dirname(fileURLToPath(import.meta.url));
+const vendored = (name) => {
+  const p = path.join(here, 'vendor', process.platform === 'win32' ? `${name}.exe` : name);
+  return fs.existsSync(p) ? p : null;
+};
+const FFMPEG = process.env.TLDW_FFMPEG || ffmpegStatic || 'ffmpeg';
+const FFPROBE = process.env.TLDW_FFPROBE || ffprobeStatic?.path || 'ffprobe';
+const YTDLP = vendored('yt-dlp') || 'yt-dlp';
+const VENV_PYTHON = (() => {
+  const p = process.platform === 'win32'
+    ? path.join(here, '.venv', 'Scripts', 'python.exe')
+    : path.join(here, '.venv', 'bin', 'python');
+  return fs.existsSync(p) ? p : null;
+})();
 
 function parseArgs(argv) {
   const a = { fps: 1, cdp: 'http://localhost:9226', model: 'base', transcribe: true, ocr: false };
@@ -51,7 +72,7 @@ function have(cmd) {
 
 function probe(file) {
   try {
-    const out = execFileSync('ffprobe', ['-v', 'error', '-show_entries',
+    const out = execFileSync(FFPROBE, ['-v', 'error', '-show_entries',
       'format=duration,size:stream=codec_type', '-of', 'json', file]).toString();
     const j = JSON.parse(out);
     const types = (j.streams || []).map((s) => s.codec_type);
@@ -158,7 +179,7 @@ function muxBest(files, dir, targetDuration) {
   if (video.hasVideo && video.hasAudio) { fs.copyFileSync(video.f, out); return out; }
   const audio = pickByDuration(tracks.filter((t) => t.hasAudio && t.f !== video.f), targetDuration);
   if (!audio) { fs.copyFileSync(video.f, out); return out; }
-  execFileSync('ffmpeg', ['-y', '-loglevel', 'error', '-i', video.f, '-i', audio.f,
+  execFileSync(FFMPEG, ['-y', '-loglevel', 'error', '-i', video.f, '-i', audio.f,
     '-c', 'copy', '-map', '0:v:0', '-map', '1:a:0', out]);
   return out;
 }
@@ -198,9 +219,22 @@ async function grabCarousel(page, dir) {
   return slides;
 }
 
+// Resolve a Python that actually has faster-whisper installed. Order: --python,
+// $TLDW_PYTHON, then PATH candidates probed via find_spec (no heavy import). This
+// avoids the common "ModuleNotFoundError: faster_whisper" when the default python
+// on PATH isn't the venv that has it.
+function pickPython(explicit) {
+  const probe = "import importlib.util,sys; sys.exit(0 if importlib.util.find_spec('faster_whisper') else 1)";
+  const candidates = [explicit, process.env.TLDW_PYTHON, VENV_PYTHON, 'python', 'py', 'python3'].filter(Boolean);
+  for (const c of candidates) {
+    const r = spawnSync(c, ['-c', probe], { stdio: 'ignore' });
+    if (r.status === 0) return c;
+  }
+  return explicit || process.env.TLDW_PYTHON || 'python';
+}
+
 function transcribe(wav, model, python) {
-  const py = python || (spawnSync('python', ['--version'], { stdio: 'ignore' }).status === 0 ? 'python' : 'py');
-  const here = path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1'));
+  const py = pickPython(python);
   const r = spawnSync(py, [path.join(here, 'transcribe.py'), wav, model], { encoding: 'utf8' });
   if (r.status !== 0) return { ok: false, error: (r.stderr || '').trim() || 'transcription failed (faster-whisper installed?)' };
   return { ok: true, text: r.stdout.trim() };
@@ -247,7 +281,8 @@ function review(meta, dir, lens, llmArg) {
 // streams UMP/SABR with signed URLs), so use yt-dlp, which handles them and
 // needs no login for public posts. Writes video.mp4 + video.info.json.
 function grabWithYtdlp(url, dir, ytdlpArg) {
-  const cmd = (ytdlpArg || process.env.TLDW_YTDLP || 'yt-dlp').split(' ');
+  const override = ytdlpArg || process.env.TLDW_YTDLP;
+  const cmd = override ? override.split(' ') : [YTDLP];
   const out = path.join(dir, 'video.%(ext)s');
   // TikTok drops requests without a real browser UA; harmless for YouTube.
   const ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36';
@@ -276,12 +311,12 @@ function processVideo(videoPath, dir, meta, a) {
   console.log(`video.mp4 ready (${(meta.durationSec ?? 0).toFixed?.(1) ?? meta.durationSec}s)`);
   const frames = path.join(dir, 'frames');
   fs.mkdirSync(frames, { recursive: true });
-  execFileSync('ffmpeg', ['-y', '-loglevel', 'error', '-i', videoPath, '-vf', `fps=${a.fps}`, path.join(frames, 'f_%02d.jpg')]);
+  execFileSync(FFMPEG, ['-y', '-loglevel', 'error', '-i', videoPath, '-vf', `fps=${a.fps}`, path.join(frames, 'f_%02d.jpg')]);
   meta.frames = fs.readdirSync(frames).length;
   console.log(`sampled ${meta.frames} frames @ ${a.fps}fps`);
   if (a.transcribe) {
     const wav = path.join(dir, 'audio.wav');
-    execFileSync('ffmpeg', ['-y', '-loglevel', 'error', '-i', videoPath, '-ar', '16000', '-ac', '1', wav]);
+    execFileSync(FFMPEG, ['-y', '-loglevel', 'error', '-i', videoPath, '-ar', '16000', '-ac', '1', wav]);
     const t = transcribe(wav, a.model, a.python);
     if (t.ok) { meta.transcript = t.text; fs.writeFileSync(path.join(dir, 'transcript.txt'), t.text + '\n'); console.log('transcript.txt written'); }
     else console.warn('skipped transcription:', t.error);
@@ -296,7 +331,7 @@ async function main() {
     console.error('supports: instagram.com/reel|p|tv, tiktok.com/@u/video|photo, youtube.com/shorts');
     process.exit(2);
   }
-  if (!have('ffmpeg') || !have('ffprobe')) { console.error('ffmpeg and ffprobe must be on PATH'); process.exit(1); }
+  if (!have(FFMPEG) || !have(FFPROBE)) { console.error('ffmpeg/ffprobe not available — run `npm install` (or `npm run setup`) in the tldw folder'); process.exit(1); }
 
   const dir = path.resolve(a.out || path.join('out', `${target.platform}_${target.id}`));
   fs.mkdirSync(dir, { recursive: true });

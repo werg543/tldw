@@ -17,24 +17,31 @@ It does not log in for you and bypasses nothing. It attaches over the Chrome Dev
 
 ## Prerequisites
 
-Read this part. tldw assumes nothing about your machine beyond these.
+The only thing you install yourself is **Node 18+**. Everything else is provisioned by `npm install` (see below) and resolved automatically, nothing needs to be on your `PATH`:
 
-- **Node 18+**.
-- **`ffmpeg` and `ffprobe`** on your `PATH`.
-- **For YouTube and TikTok: [`yt-dlp`](https://github.com/yt-dlp/yt-dlp)** on `PATH` (`pip install yt-dlp`). Those platforms stream formats a browser capture cannot reassemble (YouTube uses UMP/SABR), so tldw shells out to yt-dlp, which handles them and needs no login for public posts. Override the command with `--ytdlp` or `TLDW_YTDLP` (e.g. `--ytdlp "python -m yt_dlp"`).
+- **`ffmpeg` and `ffprobe`** come from the `ffmpeg-static` / `ffprobe-static` packages.
+- **`yt-dlp`** (for YouTube and TikTok, which stream formats a browser capture cannot reassemble) is downloaded as a standalone binary into `vendor/`. No Python needed for it. Override with `--ytdlp` or `TLDW_YTDLP` if you'd rather use your own.
+- **Transcription** ([`faster-whisper`](https://github.com/SYSTRAN/faster-whisper)) is installed into a local `.venv`, *if a Python 3.9+ is found on your machine*. No Python, no transcription, the rest still works and tldw says so.
+
+Two things are still yours to supply, only for the features that use them:
+
 - **For Instagram: your own logged-in browser**, started with remote debugging on. tldw attaches to it; it does not launch or log into anything for you. Any Chromium browser works (Chrome, Edge, Brave, Opera):
   ```
   chrome --remote-debugging-port=9226 --user-data-dir="/path/to/a/profile"
   ```
   Log into Instagram in that browser. Point tldw at it with `--cdp http://localhost:<port>` (default `9226`, it is only a default, use whatever port you launched). YouTube and TikTok do not need this.
-- **No MCP servers are required.** tldw talks to your browser over CDP and to yt-dlp as a subprocess. It does not depend on any Model Context Protocol setup.
-- *Optional:* Python with [`faster-whisper`](https://github.com/SYSTRAN/faster-whisper) for transcripts; `tesseract` for carousel OCR; any LLM CLI for `--review`. Each is only needed for the feature that uses it, and tldw tells you when one is missing instead of failing silently.
+- *Optional:* `tesseract` on `PATH` for carousel OCR; any LLM CLI for `--review` (defaults to `claude -p`). Each is only needed for the feature that uses it, and tldw tells you when one is missing instead of failing silently.
+
+**No MCP servers are required.** tldw talks to your browser over CDP and to yt-dlp as a subprocess.
 
 ## Install
 
 ```
+git clone <repo> && cd tldw
 npm install
 ```
+
+`npm install` runs `setup.mjs`, which downloads yt-dlp and builds the Whisper venv. If you ever need to re-run that step alone: `npm run setup`.
 
 ## Quick start
 
